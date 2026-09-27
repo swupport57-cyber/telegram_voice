@@ -1,5 +1,7 @@
-import { TelegramClient } from 'telegram';
+import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
+import { CustomFile } from 'telegram/client/uploads.js';
+import { computeCheck } from 'telegram/Password.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
@@ -14,13 +16,13 @@ const { Pool } = pg;
 // ---- config ----
 const PORT = process.env.PORT || 3001;
 const APP_BASE_URL = process.env.APP_BASE_URL;
-const TG_API_ID = parseInt(process.env.TG_API_ID);
+const TG_API_ID = parseInt(process.env.TG_API_ID, 10);
 const TG_API_HASH = process.env.TG_API_HASH;
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
 
 if (!APP_BASE_URL || !TG_API_ID || !TG_API_HASH || !SUPABASE_DB_URL || !BRIDGE_SECRET) {
-  console.error('Missing required environment variables');
+  console.error('Missing required environment variables: APP_BASE_URL, TG_API_ID, TG_API_HASH, SUPABASE_DB_URL, BRIDGE_SECRET');
   process.exit(1);
 }
 
@@ -32,8 +34,13 @@ const clients = new Map();
 // Per-user login state: userId -> { client, phoneCodeHash, phone }
 const pendingLogins = new Map();
 
+function schemaFor(userId) {
+  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
+  return `tg_${safe}`;
+}
+
 async function getUserSession(userId) {
-  const schema = `tg_${String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default'}`;
+  const schema = schemaFor(userId);
   await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
   await adminPool.query(`
     CREATE TABLE IF NOT EXISTS ${schema}.sessions (
@@ -50,7 +57,15 @@ async function getUserSession(userId) {
 }
 
 async function saveUserSession(userId, sessionString) {
-  const schema = `tg_${String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default'}`;
+  const schema = schemaFor(userId);
+  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+  await adminPool.query(`
+    CREATE TABLE IF NOT EXISTS ${schema}.sessions (
+      user_id TEXT PRIMARY KEY,
+      session_string TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
   await adminPool.query(
     `INSERT INTO ${schema}.sessions (user_id, session_string, updated_at)
      VALUES ($1, $2, NOW())
@@ -76,8 +91,13 @@ async function getOrCreateClient(userId) {
   if (sessionString) {
     try {
       await client.connect();
-      entry.connected = true;
-      console.log(`[${userId}] reconnected from saved session`);
+      const me = await client.getMe();
+      if (me) {
+        entry.connected = true;
+        console.log(`[${userId}] reconnected from saved session`);
+      } else {
+        throw new Error('Session present but not authorized');
+      }
     } catch (e) {
       console.error(`[${userId}] reconnect failed:`, e.message);
       clients.delete(userId);
@@ -125,7 +145,12 @@ const server = http.createServer(async (req, res) => {
 
       const cleanPhone = String(phone).replace(/[^0-9+]/g, '');
 
-      // Create a fresh client for this login attempt.
+      // Drop any stale pending login for this user.
+      const old = pendingLogins.get(userId);
+      if (old?.client) {
+        try { await old.client.disconnect(); } catch {}
+      }
+
       const session = new StringSession('');
       const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
         connectionRetries: 5,
@@ -134,13 +159,12 @@ const server = http.createServer(async (req, res) => {
 
       await client.connect();
 
-      const result = await client.invoke({
-        _: 'auth.sendCode',
+      const result = await client.invoke(new Api.auth.SendCode({
         phoneNumber: cleanPhone,
         apiId: TG_API_ID,
         apiHash: TG_API_HASH,
-        settings: { _: 'codeSettings' },
-      });
+        settings: new Api.CodeSettings({}),
+      }));
 
       pendingLogins.set(userId, {
         client,
@@ -167,17 +191,15 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        await pending.client.invoke({
-          _: 'auth.signIn',
+        await pending.client.invoke(new Api.auth.SignIn({
           phoneNumber: pending.phone,
           phoneCodeHash: pending.phoneCodeHash,
           phoneCode: String(code),
-        });
+        }));
 
         const sessionString = pending.client.session.save();
         await saveUserSession(userId, sessionString);
 
-        // Move the authenticated client into the live cache.
         clients.set(userId, { client: pending.client, connected: true });
         pendingLogins.delete(userId);
 
@@ -188,6 +210,8 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: true, passwordNeeded: true, message: '2FA password required.' }));
         } else if (msg.includes('PHONE_CODE_INVALID')) {
           res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Invalid code. Try again.' }));
+        } else if (msg.includes('PHONE_CODE_EXPIRED')) {
+          res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Code expired. Start over.' }));
         } else {
           res.writeHead(500).end(JSON.stringify({ ok: false, error: msg }));
         }
@@ -210,13 +234,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        await pending.client.invoke({
-          _: 'auth.checkPassword',
-          password: await pending.client.invoke({
-            _: 'account.getPassword',
-            password: password,
-          }),
-        });
+        const pwd = await pending.client.invoke(new Api.account.GetPassword());
+        const check = await computeCheck(pwd, password);
+        await pending.client.invoke(new Api.auth.CheckPassword({ password: check }));
 
         const sessionString = pending.client.session.save();
         await saveUserSession(userId, sessionString);
@@ -225,7 +245,12 @@ const server = http.createServer(async (req, res) => {
 
         res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
       } catch (err) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: err?.errorMessage || 'Wrong password.' }));
+        const msg = err?.errorMessage || err?.message || String(err);
+        if (msg.includes('PASSWORD_HASH_INVALID')) {
+          res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Wrong password.' }));
+        } else {
+          res.writeHead(400).end(JSON.stringify({ ok: false, error: msg }));
+        }
       }
       return;
     }
@@ -233,8 +258,13 @@ const server = http.createServer(async (req, res) => {
     // ---- GET /tg/status ----
     if (req.method === 'GET' && url.pathname === '/tg/status') {
       const userId = url.searchParams.get('userId');
+      if (!userId) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId required' }));
+        return;
+      }
       const entry = clients.get(userId);
-      const hasSaved = userId ? !!(await getUserSession(userId)) : false;
+      let hasSaved = false;
+      try { hasSaved = !!(await getUserSession(userId)); } catch {}
       res.end(JSON.stringify({
         ok: true,
         connected: !!entry?.connected,
@@ -257,7 +287,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Fetch the converted audio from app.py
       const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
       if (!audioRes.ok) {
         res.writeHead(502).end(JSON.stringify({ ok: false, error: `Audio fetch failed: ${audioRes.status}` }));
@@ -274,17 +303,17 @@ const server = http.createServer(async (req, res) => {
 
       try {
         if (mode === 'video') {
-          // Video note: mp4, square, with audio.
           await execAsync(
             `ffmpeg -y -i "${inPath}" ` +
-            `-c:v libx264 -preset ultrafast -crf 28 ` +
+            `-t 60 ` +
             `-vf "scale=480:480:force_original_aspect_ratio=increase,crop=480:480" ` +
-            `-c:a aac -b:a 64k -movflags +faststart ` +
-            `-t 60 "${outPath}"`,
+            `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p ` +
+            `-c:a aac -b:a 64k ` +
+            `-movflags +faststart ` +
+            `"${outPath}"`,
             { timeout: 60000 }
           );
         } else {
-          // Voice note: OGG / Opus / 16kHz / mono.
           await execAsync(
             `ffmpeg -y -i "${inPath}" ` +
             `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
@@ -294,12 +323,11 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
+        const stat = await fs.stat(outPath);
+        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
+
         const media = await entry.client.uploadFile({
-          file: new CustomFile(
-            path.basename(outPath),
-            (await fs.stat(outPath)).size,
-            outPath
-          ),
+          file,
           workers: 1,
         });
 
@@ -307,7 +335,6 @@ const server = http.createServer(async (req, res) => {
           file: media,
           voiceNote: mode !== 'video',
           videoNote: mode === 'video',
-          attributes: mode === 'video' ? [] : undefined,
         };
 
         await entry.client.sendFile(to, sendOptions);
@@ -326,8 +353,5 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(500).end(JSON.stringify({ ok: false, error: err?.message || String(err) }));
   }
 });
-
-// GramJS needs a CustomFile wrapper for uploads.
-import { CustomFile } from 'telegram/client/uploads.js';
 
 server.listen(PORT, () => console.log(`TG bridge on :${PORT}`));
