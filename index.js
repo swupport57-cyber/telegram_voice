@@ -1,4 +1,4 @@
-import { createClient } from 'whatsmeow-node';
+import { createClient } from '@whatsmeow-node/whatsmeow-node';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
