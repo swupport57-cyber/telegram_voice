@@ -1,5 +1,5 @@
 import { TelegramClient, Api } from 'telegram';
-import { StringSession } from 'telegram/sessions';
+import { StringSession } from 'telegram/sessions/index.js';
 import { CustomFile } from 'telegram/client/uploads.js';
 import { computeCheck } from 'telegram/Password.js';
 import { exec } from 'child_process';
@@ -39,7 +39,7 @@ function schemaFor(userId) {
   return `tg_${safe}`;
 }
 
-async function getUserSession(userId) {
+async function ensureSchema(userId) {
   const schema = schemaFor(userId);
   await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
   await adminPool.query(`
@@ -49,6 +49,11 @@ async function getUserSession(userId) {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  return schema;
+}
+
+async function getUserSession(userId) {
+  const schema = await ensureSchema(userId);
   const res = await adminPool.query(
     `SELECT session_string FROM ${schema}.sessions WHERE user_id = $1`,
     [userId]
@@ -57,15 +62,7 @@ async function getUserSession(userId) {
 }
 
 async function saveUserSession(userId, sessionString) {
-  const schema = schemaFor(userId);
-  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
-  await adminPool.query(`
-    CREATE TABLE IF NOT EXISTS ${schema}.sessions (
-      user_id TEXT PRIMARY KEY,
-      session_string TEXT NOT NULL,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
+  const schema = await ensureSchema(userId);
   await adminPool.query(
     `INSERT INTO ${schema}.sessions (user_id, session_string, updated_at)
      VALUES ($1, $2, NOW())
@@ -148,7 +145,7 @@ const server = http.createServer(async (req, res) => {
       // Drop any stale pending login for this user.
       const old = pendingLogins.get(userId);
       if (old?.client) {
-        try { await old.client.disconnect(); } catch {}
+        try { await old.client.disconnect(); } catch (e) {}
       }
 
       const session = new StringSession('');
@@ -264,7 +261,7 @@ const server = http.createServer(async (req, res) => {
       }
       const entry = clients.get(userId);
       let hasSaved = false;
-      try { hasSaved = !!(await getUserSession(userId)); } catch {}
+      try { hasSaved = !!(await getUserSession(userId)); } catch (e) {}
       res.end(JSON.stringify({
         ok: true,
         connected: !!entry?.connected,
