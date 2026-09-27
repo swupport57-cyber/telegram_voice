@@ -6,7 +6,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "whatsmeow-node": "^0.1.0"
+    "@whatsmeow-node/whatsmeow-node": "^0.7.0",
+    "pg": "^8.11.0"
   },
   "engines": {
     "node": ">=18"
