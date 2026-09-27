@@ -306,8 +306,8 @@ const server = http.createServer(async (req, res) => {
 
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const inPath = path.join(tmpDir, `tg-${stamp}.wav`);
-      const outPath = path.join(tmpDir, `tg-${stamp}.ogg`);
+      const inPath = path.join(tmpDir, `tg-in-${stamp}.wav`);
+      const outPath = path.join(tmpDir, `tg-out-${stamp}.ogg`);
 
       await fs.writeFile(inPath, inputBuf);
 
@@ -320,9 +320,6 @@ const server = http.createServer(async (req, res) => {
           { timeout: 30000 }
         );
 
-        // Resolve the entity first, then send. This is what makes the difference
-        // between "voice send works" and "video send doesn't" — voice has more
-        // forgiving peer resolution, video notes require a resolved entity.
         const entity = await entry.client.getEntity(to);
 
         const stat = await fs.stat(outPath);
@@ -391,13 +388,14 @@ const server = http.createServer(async (req, res) => {
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const ext = path.extname(videoName) || '.mp4';
-      const inPath = path.join(tmpDir, `tgvid-${stamp}${ext}`);
-      const outPath = path.join(tmpDir, `tgvid-${stamp}.mp4`);
+      // Input and output MUST have different names. When both end in .mp4,
+      // ffmpeg refuses with "cannot edit existing files in-place".
+      const inPath  = path.join(tmpDir, `tgvid-in-${stamp}${ext}`);
+      const outPath = path.join(tmpDir, `tgvid-out-${stamp}.mp4`);
 
       await fs.writeFile(inPath, videoBuf);
 
       try {
-        // Square crop, 480x480, H.264, capped at 60s.
         await execAsync(
           `ffmpeg -y -i "${inPath}" ` +
           `-t 60 ` +
@@ -409,10 +407,6 @@ const server = http.createServer(async (req, res) => {
           { timeout: 180000 }
         );
 
-        // Resolve the entity. Video notes need a fully resolved peer, and
-        // getEntity forces GramJS to look up the user and cache their
-        // access_hash. Without this, "user not found" even for people who
-        // appear to be reachable via voice notes.
         const entity = await entry.client.getEntity(formTo);
 
         const stat = await fs.stat(outPath);
