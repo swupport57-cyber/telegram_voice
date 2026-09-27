@@ -28,10 +28,7 @@ if (!APP_BASE_URL || !TG_API_ID || !TG_API_HASH || !SUPABASE_DB_URL || !BRIDGE_S
 
 const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
 
-// In-memory client cache, keyed by userId
 const clients = new Map();
-
-// Per-user login state: userId -> { client, phoneCodeHash, phone }
 const pendingLogins = new Map();
 
 function schemaFor(userId) {
@@ -105,6 +102,22 @@ async function getOrCreateClient(userId) {
   return entry;
 }
 
+function splitMultipart(buf, boundary) {
+  const delim = Buffer.from('\r\n' + boundary);
+  const parts = [];
+  let start = 0;
+  while (true) {
+    const idx = buf.indexOf(delim, start);
+    if (idx === -1) {
+      parts.push(buf.slice(start));
+      break;
+    }
+    if (idx > start) parts.push(buf.slice(start, idx));
+    start = idx + delim.length;
+  }
+  return parts;
+}
+
 // ---- the server ----
 
 const server = http.createServer(async (req, res) => {
@@ -119,7 +132,8 @@ const server = http.createServer(async (req, res) => {
 
   const chunks = [];
   for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString('utf8');
+  const rawBodyBuffer = Buffer.concat(chunks);
+  const raw = rawBodyBuffer.toString('utf8');
 
   res.setHeader('Content-Type', 'application/json');
 
@@ -142,7 +156,6 @@ const server = http.createServer(async (req, res) => {
 
       const cleanPhone = String(phone).replace(/[^0-9+]/g, '');
 
-      // Drop any stale pending login for this user.
       const old = pendingLogins.get(userId);
       if (old?.client) {
         try { await old.client.disconnect(); } catch (e) {}
@@ -202,15 +215,15 @@ const server = http.createServer(async (req, res) => {
 
         res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
       } catch (err) {
-        const msg = err?.errorMessage || err?.message || String(err);
-        if (msg.includes('SESSION_PASSWORD_NEEDED')) {
+        const m = err?.errorMessage || err?.message || String(err);
+        if (m.includes('SESSION_PASSWORD_NEEDED')) {
           res.end(JSON.stringify({ ok: true, passwordNeeded: true, message: '2FA password required.' }));
-        } else if (msg.includes('PHONE_CODE_INVALID')) {
+        } else if (m.includes('PHONE_CODE_INVALID')) {
           res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Invalid code. Try again.' }));
-        } else if (msg.includes('PHONE_CODE_EXPIRED')) {
+        } else if (m.includes('PHONE_CODE_EXPIRED')) {
           res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Code expired. Start over.' }));
         } else {
-          res.writeHead(500).end(JSON.stringify({ ok: false, error: msg }));
+          res.writeHead(500).end(JSON.stringify({ ok: false, error: m }));
         }
       }
       return;
@@ -242,11 +255,11 @@ const server = http.createServer(async (req, res) => {
 
         res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
       } catch (err) {
-        const msg = err?.errorMessage || err?.message || String(err);
-        if (msg.includes('PASSWORD_HASH_INVALID')) {
+        const m = err?.errorMessage || err?.message || String(err);
+        if (m.includes('PASSWORD_HASH_INVALID')) {
           res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Wrong password.' }));
         } else {
-          res.writeHead(400).end(JSON.stringify({ ok: false, error: msg }));
+          res.writeHead(400).end(JSON.stringify({ ok: false, error: m }));
         }
       }
       return;
@@ -270,7 +283,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ---- POST /tg/send ----
+    // ---- POST /tg/send ---- (voice note from resultId)
     if (req.method === 'POST' && url.pathname === '/tg/send') {
       const { userId, to, resultId, mode } = JSON.parse(raw || '{}');
       if (!userId || !to || !resultId) {
@@ -294,49 +307,124 @@ const server = http.createServer(async (req, res) => {
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const inPath = path.join(tmpDir, `tg-${stamp}.wav`);
-      const outPath = path.join(tmpDir, `tg-${stamp}.${mode === 'video' ? 'mp4' : 'ogg'}`);
+      const outPath = path.join(tmpDir, `tg-${stamp}.ogg`);
 
       await fs.writeFile(inPath, inputBuf);
 
       try {
-        if (mode === 'video') {
-          await execAsync(
-            `ffmpeg -y -i "${inPath}" ` +
-            `-t 60 ` +
-            `-vf "scale=480:480:force_original_aspect_ratio=increase,crop=480:480" ` +
-            `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p ` +
-            `-c:a aac -b:a 64k ` +
-            `-movflags +faststart ` +
-            `"${outPath}"`,
-            { timeout: 60000 }
-          );
-        } else {
-          await execAsync(
-            `ffmpeg -y -i "${inPath}" ` +
-            `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
-            `-application voip -avoid_negative_ts make_zero -map_metadata -1 ` +
-            `"${outPath}"`,
-            { timeout: 30000 }
-          );
-        }
+        await execAsync(
+          `ffmpeg -y -i "${inPath}" ` +
+          `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
+          `-application voip -avoid_negative_ts make_zero -map_metadata -1 ` +
+          `"${outPath}"`,
+          { timeout: 30000 }
+        );
+
+        // Resolve the entity first, then send. This is what makes the difference
+        // between "voice send works" and "video send doesn't" — voice has more
+        // forgiving peer resolution, video notes require a resolved entity.
+        const entity = await entry.client.getEntity(to);
 
         const stat = await fs.stat(outPath);
         const file = new CustomFile(path.basename(outPath), stat.size, outPath);
+        const media = await entry.client.uploadFile({ file, workers: 1 });
 
-        const media = await entry.client.uploadFile({
-          file,
-          workers: 1,
-        });
-
-        const sendOptions = {
+        await entry.client.sendFile(entity, {
           file: media,
           voiceNote: mode !== 'video',
           videoNote: mode === 'video',
-        };
-
-        await entry.client.sendFile(to, sendOptions);
+        });
 
         res.end(JSON.stringify({ ok: true, to, mode: mode || 'voice' }));
+      } finally {
+        await fs.unlink(inPath).catch(() => {});
+        await fs.unlink(outPath).catch(() => {});
+      }
+      return;
+    }
+
+    // ---- POST /tg/send-video ---- (multipart upload)
+    if (req.method === 'POST' && url.pathname === '/tg/send-video') {
+      const contentType = req.headers['content-type'] || '';
+      const boundaryMatch = contentType.match(/boundary=(.+)$/);
+      if (!boundaryMatch) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'multipart/form-data required' }));
+        return;
+      }
+
+      const boundary = '--' + boundaryMatch[1];
+      const parts = splitMultipart(rawBodyBuffer, boundary);
+
+      let videoBuf = null, videoName = 'video.mp4';
+      let formUserId = null, formTo = null;
+
+      for (const part of parts) {
+        const headerEnd = part.indexOf('\r\n\r\n');
+        if (headerEnd === -1) continue;
+        const headers = part.slice(0, headerEnd).toString();
+        const body = part.slice(headerEnd + 4);
+        const nameMatch = headers.match(/name="([^"]+)"/);
+        const fileMatch = headers.match(/filename="([^"]+)"/);
+        if (!nameMatch) continue;
+        const fieldName = nameMatch[1];
+        if (fieldName === 'video' && fileMatch) {
+          videoBuf = body;
+          videoName = fileMatch[1];
+        } else if (fieldName === 'userId') {
+          formUserId = body.toString().trim();
+        } else if (fieldName === 'to') {
+          formTo = body.toString().trim();
+        }
+      }
+
+      if (!videoBuf || !formUserId || !formTo) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'video, userId, to required' }));
+        return;
+      }
+
+      const entry = clients.get(formUserId);
+      if (!entry?.connected) {
+        res.writeHead(409).end(JSON.stringify({ ok: false, error: 'Not logged in.' }));
+        return;
+      }
+
+      const tmpDir = os.tmpdir();
+      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const ext = path.extname(videoName) || '.mp4';
+      const inPath = path.join(tmpDir, `tgvid-${stamp}${ext}`);
+      const outPath = path.join(tmpDir, `tgvid-${stamp}.mp4`);
+
+      await fs.writeFile(inPath, videoBuf);
+
+      try {
+        // Square crop, 480x480, H.264, capped at 60s.
+        await execAsync(
+          `ffmpeg -y -i "${inPath}" ` +
+          `-t 60 ` +
+          `-vf "scale=480:480:force_original_aspect_ratio=increase,crop=480:480" ` +
+          `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p ` +
+          `-c:a aac -b:a 64k ` +
+          `-movflags +faststart ` +
+          `"${outPath}"`,
+          { timeout: 180000 }
+        );
+
+        // Resolve the entity. Video notes need a fully resolved peer, and
+        // getEntity forces GramJS to look up the user and cache their
+        // access_hash. Without this, "user not found" even for people who
+        // appear to be reachable via voice notes.
+        const entity = await entry.client.getEntity(formTo);
+
+        const stat = await fs.stat(outPath);
+        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
+        const media = await entry.client.uploadFile({ file, workers: 1 });
+
+        await entry.client.sendFile(entity, {
+          file: media,
+          videoNote: true,
+        });
+
+        res.end(JSON.stringify({ ok: true, to: formTo, bytes: stat.size }));
       } finally {
         await fs.unlink(inPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
